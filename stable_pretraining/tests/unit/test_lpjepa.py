@@ -9,9 +9,10 @@ import torch
 from torch import nn
 from timm.models.vision_transformer import VisionTransformer
 
+from stable_pretraining import Module
+from stable_pretraining.forward import lpjepa
 from stable_pretraining.methods.lpjepa import (
     LpJEPA,
-    LpJEPAOutput,
     RDMReg,
     SlicedWassersteinDistance,
 )
@@ -280,35 +281,44 @@ def make_model(monkeypatch):
             drop_path_rate=0.0,
         )
         config.update(kwargs)
-        return LpJEPA(**config)
+        model = LpJEPA(**config)
+        monkeypatch.setattr(model, "log_dict", Mock())
+        return model
 
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(7)
         yield create_model
 
 
-def _image_views():
+def _image_batch():
     generator = torch.Generator().manual_seed(11)
-    return tuple(torch.randn(2, 3, 32, 32, generator=generator) for _ in range(2))
+    return {
+        "views": [
+            {"image": torch.randn(2, 3, 32, 32, generator=generator)} for _ in range(2)
+        ]
+    }
 
 
 def test_lpjepa_training_output_and_gradients(make_model):
     model = make_model().train()
-    view1, view2 = _image_views()
-    output = model(view1, view2)
+    batch = _image_batch()
+    output = model(batch, "fit")
 
-    assert isinstance(output, LpJEPAOutput)
-    assert output["loss"] is output.loss
-    for loss in (output.loss, output.inv_loss, output.rdmreg_loss):
+    assert isinstance(output, dict)
+    assert set(output) == {"embedding", "projection", "loss", "inv_loss", "rdmreg_loss"}
+    for loss in (output["loss"], output["inv_loss"], output["rdmreg_loss"]):
         assert loss.ndim == 0
         assert torch.isfinite(loss)
-    assert output.embedding.shape == (4, 24)
+    assert output["embedding"].shape == (4, 24)
+    assert output["projection"].shape == (4, 8)
+    assert torch.isfinite(output["projection"]).all()
+    assert (output["projection"] >= 0).all()
     with torch.no_grad():
-        expected = torch.cat([model.encoder(view1), model.encoder(view2)])
-    torch.testing.assert_close(output.embedding, expected, rtol=1e-5, atol=1e-6)
+        expected = torch.cat([model.backbone(view["image"]) for view in batch["views"]])
+    torch.testing.assert_close(output["embedding"], expected, rtol=1e-5, atol=1e-6)
 
-    output.loss.backward()
-    for module in (model.encoder, model.projector):
+    output["loss"].backward()
+    for module in (model.backbone, model.projector):
         grads = [
             parameter.grad
             for parameter in module.parameters()
@@ -326,24 +336,58 @@ def test_lpjepa_forward_uses_configured_loss_weights(
     make_model, inv_weight, rdmreg_weight
 ):
     model = make_model(inv_weight=inv_weight, rdmreg_weight=rdmreg_weight)
-    output = model(*_image_views())
-    expected = inv_weight * output.inv_loss + rdmreg_weight * output.rdmreg_loss
-    torch.testing.assert_close(output.loss, expected, rtol=1e-6, atol=1e-6)
+    output = model(_image_batch(), "fit")
+    expected = inv_weight * output["inv_loss"] + rdmreg_weight * output["rdmreg_loss"]
+    torch.testing.assert_close(output["loss"], expected, rtol=1e-6, atol=1e-6)
 
 
-def test_lpjepa_compute_loss_matches_direct_mse(make_model, monkeypatch):
-    model = make_model()
+@pytest.mark.parametrize("view_format", ["list", "dict", "named"])
+def test_lpjepa_shared_forward_matches_direct_mse_and_preserves_order(
+    monkeypatch, view_format
+):
+    model = Module(
+        forward=lpjepa,
+        backbone=nn.Identity(),
+        projector=nn.Identity(),
+        rdmreg=RDMReg(num_slices=2),
+        inv_weight=2.0,
+        rdmreg_weight=3.0,
+    )
     z1 = torch.tensor([[0.0, 2.0], [4.0, 6.0]])
     z2 = torch.tensor([[1.0, 0.0], [2.0, 3.0]])
+    views = {
+        "second": {"image": z1, "label": torch.tensor([0, 1])},
+        "first": {"image": z2, "label": torch.tensor([2, 3])},
+    }
+    if view_format == "list":
+        batch = {"views": list(views.values())}
+    elif view_format == "dict":
+        batch = {"views": views}
+    else:
+        batch = views
     regularizer = Mock(return_value=torch.tensor(2.0))
     monkeypatch.setattr(model.rdmreg, "forward", regularizer)
+    log_dict = Mock()
+    monkeypatch.setattr(model, "log_dict", log_dict)
 
-    loss, inv_loss, rdmreg_loss = model._compute_loss(z1, z2, 2.0, 3.0)
+    output = model(batch, "fit")
 
-    regularizer.assert_called_once_with(z1, z2)
-    assert inv_loss.item() == pytest.approx(4.5, abs=1e-6)
-    assert rdmreg_loss.item() == pytest.approx(2.0, abs=1e-6)
-    assert loss.item() == pytest.approx(15.0, abs=1e-6)
+    regularizer.assert_called_once()
+    for actual, expected in zip(regularizer.call_args.args, (z1, z2)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert output["inv_loss"].item() == pytest.approx(4.5, abs=1e-6)
+    assert output["rdmreg_loss"].item() == pytest.approx(2.0, abs=1e-6)
+    assert output["loss"].item() == pytest.approx(15.0, abs=1e-6)
+    torch.testing.assert_close(output["embedding"], torch.cat([z1, z2]))
+    torch.testing.assert_close(output["projection"], torch.cat([z1, z2]))
+    assert output["label"].tolist() == [0, 1, 2, 3]
+    log_dict.assert_called_once_with(
+        {f"fit/{key}": output[key] for key in ("loss", "inv_loss", "rdmreg_loss")},
+        on_step=True,
+        on_epoch=True,
+        sync_dist=True,
+        batch_size=2,
+    )
 
 
 def test_lpjepa_default_projector_outputs_2048_features(make_model):
@@ -354,12 +398,13 @@ def test_lpjepa_default_projector_outputs_2048_features(make_model):
     )
     try:
         with torch.no_grad():
-            output = model(*_image_views())
+            output = model(_image_batch(), "fit")
     finally:
         handle.remove()
 
     assert shapes == [(2, 2048), (2, 2048)]
-    assert torch.isfinite(output.loss)
+    assert output["projection"].shape == (4, 2048)
+    assert torch.isfinite(output["loss"])
 
 
 def test_lpjepa_custom_projector_is_rectified_before_both_losses(
@@ -369,52 +414,69 @@ def test_lpjepa_custom_projector_is_rectified_before_both_losses(
     bias = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
     with torch.no_grad():
         projector.weight.zero_()
+        projector.weight[:, 0].fill_(1)
         projector.bias.copy_(bias)
     model = make_model(projector=projector)
+    model.backbone = nn.Identity()
     assert model.projector is projector
-    compute_loss = Mock(wraps=model._compute_loss)
-    monkeypatch.setattr(model, "_compute_loss", compute_loss)
+    regularizer = Mock(wraps=model.rdmreg.forward)
+    monkeypatch.setattr(model.rdmreg, "forward", regularizer)
+    view1, view2 = torch.zeros(2, 24), torch.zeros(2, 24)
+    view1[:, 0] = -1
+    view2[:, 0] = 1
 
-    model(*_image_views())
+    output = model({"views": [{"image": view1}, {"image": view2}]}, "fit")
 
-    compute_loss.assert_called_once()
-    z1, z2 = compute_loss.call_args.args[:2]
-    expected = bias.relu().expand(2, -1)
-    torch.testing.assert_close(z1, expected, rtol=0, atol=0)
-    torch.testing.assert_close(z2, expected, rtol=0, atol=0)
+    regularizer.assert_called_once()
+    z1, z2 = regularizer.call_args.args
+    expected1 = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0]).expand(2, -1)
+    expected2 = torch.tensor([0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expand(2, -1)
+    torch.testing.assert_close(z1, expected1, rtol=0, atol=0)
+    torch.testing.assert_close(z2, expected2, rtol=0, atol=0)
+    torch.testing.assert_close(output["projection"], torch.cat([expected1, expected2]))
+    assert output["inv_loss"].item() == pytest.approx(21 / 8, abs=1e-6)
 
 
 @pytest.mark.parametrize("supply_second_view", [False, True])
-def test_lpjepa_evaluation_returns_encoder_features_only(
+def test_lpjepa_evaluation_returns_features_and_projections_without_losses(
     make_model, monkeypatch, supply_second_view
 ):
     model = make_model().eval()
-    view1, view2 = _image_views()
-    projector = Mock(side_effect=AssertionError("projector called in evaluation"))
+    views = _image_batch()["views"][: 2 if supply_second_view else 1]
+    for index, view in enumerate(views):
+        view["label"] = torch.tensor([2 * index, 2 * index + 1])
+    batch = {"views": views} if supply_second_view else views[0]
+    with torch.no_grad():
+        embeddings = [model.backbone(view["image"]) for view in views]
+        projections = [model.projector(embedding).relu() for embedding in embeddings]
+    projector = Mock(wraps=model.projector.forward)
     regularizer = Mock(side_effect=AssertionError("RDMReg called in evaluation"))
     monkeypatch.setattr(model.projector, "forward", projector)
     monkeypatch.setattr(model.rdmreg, "forward", regularizer)
     model.rdmreg.global_step.fill_(7)
 
     with torch.no_grad():
-        expected = model.encoder(view1)
-        output = model(view1, view2) if supply_second_view else model(view1)
+        output = model(batch, "validate")
 
-    assert isinstance(output, LpJEPAOutput)
-    assert output.embedding.shape == (2, 24)
-    torch.testing.assert_close(output.embedding, expected, rtol=1e-5, atol=1e-6)
-    for loss in (output.loss, output.inv_loss, output.rdmreg_loss):
-        assert loss.shape == ()
-        assert loss.item() == 0
-        assert loss.dtype == output.embedding.dtype
-        assert loss.device == output.embedding.device
-    projector.assert_not_called()
+    assert isinstance(output, dict)
+    assert set(output) == {"embedding", "projection", "label"}
+    assert output["embedding"].shape == (2 * len(views), 24)
+    assert output["projection"].shape == (2 * len(views), 8)
+    torch.testing.assert_close(
+        output["embedding"], torch.cat(embeddings), rtol=1e-5, atol=1e-6
+    )
+    torch.testing.assert_close(
+        output["projection"], torch.cat(projections), rtol=1e-5, atol=1e-6
+    )
+    assert output["label"].tolist() == list(range(2 * len(views)))
+    assert projector.call_count == len(views)
     regularizer.assert_not_called()
+    model.log_dict.assert_not_called()
     assert model.rdmreg.global_step.item() == 7
 
 
 def test_lpjepa_training_requires_second_view(make_model):
     model = make_model().train()
-    view1, _ = _image_views()
-    with pytest.raises(AssertionError, match="view2 must be provided"):
-        model(view1)
+    batch = _image_batch()["views"][0]
+    with pytest.raises(ValueError, match="exactly 2 views"):
+        model(batch, "fit")

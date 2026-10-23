@@ -12,15 +12,15 @@ References:
 """
 
 import math
-from dataclasses import dataclass
-from transformers.utils import ModelOutput
-from typing import Optional
+from typing import Any, Optional
 
 import timm
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributed.nn import all_gather
+
+from stable_pretraining import Module
+from stable_pretraining.forward import lpjepa as lpjepa_forward
 
 
 class SlicedWassersteinDistance(nn.Module):
@@ -87,7 +87,6 @@ class RDMReg(nn.Module):
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
 
-        # This has been checked
         if sigma is None:
             sigma = math.exp(
                 0.5 * (math.lgamma(1 / p) - math.lgamma(3 / p)) - math.log(p) / p
@@ -211,24 +210,7 @@ class RDMReg(nn.Module):
             return (loss1 + loss2) / 2
 
 
-@dataclass
-class LpJEPAOutput(ModelOutput):
-    """Output from LpJEPA forward pass.
-
-    :ivar loss: Weighted sum of invariance and RDMReg losses (0 in eval mode).
-    :ivar embedding: Encoder features [2B, D] (train) or [B, D] (eval).
-        Training features are concatenated in view1, view2 order.
-    :ivar inv_loss: Unweighted MSE between rectified projections (0 in eval).
-    :ivar rdmreg_loss: Unweighted RDMReg component (0 in eval).
-    """
-
-    loss: torch.Tensor = None
-    embedding: torch.Tensor = None
-    inv_loss: torch.Tensor = None
-    rdmreg_loss: torch.Tensor = None
-
-
-class LpJEPA(nn.Module):
+class LpJEPA(Module):
     """Rectified LpJEPA: two-view invariance + RDMReg.
 
     Architecture:
@@ -238,8 +220,9 @@ class LpJEPA(nn.Module):
 
     Both losses operate on rectified projections of two augmented views.
     The invariance term compares corresponding images across views, while
-    RDMReg matches each view's distribution to sampled targets. Evaluation
-    returns encoder features and skips the projector and losses.
+    RDMReg matches each view's distribution to sampled targets. The forward
+    delegates to :func:`stable_pretraining.forward.lpjepa`. Evaluation returns
+    encoder features and rectified projections, without loss computation.
 
     :param inv_weight: Weight of the invariance MSE term.
     :param rdmreg_weight: Weight of the distribution-matching term.
@@ -257,6 +240,37 @@ class LpJEPA(nn.Module):
         the scale that gives the unrectified distribution unit variance.
     :param pretrained: Load pretrained timm encoder weights (default: False).
     :param drop_path_rate: Encoder stochastic depth rate (default: 0.1).
+
+    Example:
+        Create a small ViT model and exercise the dictionary API with synthetic
+        image batches. In training, the two views must be augmentations of the
+        same images in matching row order.
+
+        .. code-block:: python
+
+            import torch
+            import stable_pretraining as spt
+
+            model = spt.LpJEPA(
+                inv_weight=25.0,
+                rdmreg_weight=125.0,
+                encoder_name="vit_tiny_patch16_224",
+                pretrained=False,
+            )
+            views = [{"image": torch.randn(2, 3, 224, 224)} for _ in range(2)]
+
+            model.train()
+            output = model({"views": views}, stage="fit")
+            output["loss"].backward()
+
+            model.eval()
+            with torch.no_grad():
+                output = model(views[0], stage="validate")
+            embedding = output["embedding"]  # [2, 192] backbone features
+            projection = output["projection"]  # [2, 2048] rectified projections
+
+        Both entry points use :func:`stable_pretraining.forward.lpjepa`, which
+        documents the batch format, output keys, and training/evaluation behavior.
     """
 
     def __init__(
@@ -275,7 +289,7 @@ class LpJEPA(nn.Module):
         super().__init__()
         self.inv_weight = inv_weight
         self.rdmreg_weight = rdmreg_weight
-        self.encoder = timm.create_model(
+        self.backbone = timm.create_model(
             encoder_name,
             pretrained=pretrained,
             num_classes=0,
@@ -284,7 +298,7 @@ class LpJEPA(nn.Module):
         )
         if projector is None:
             projector = nn.Sequential(
-                nn.Linear(self.encoder.num_features, 2048),
+                nn.Linear(self.backbone.num_features, 2048),
                 nn.BatchNorm1d(2048),
                 nn.ReLU(),
                 nn.Linear(2048, 2048),
@@ -296,68 +310,16 @@ class LpJEPA(nn.Module):
         self.projector = projector
         self.rdmreg = RDMReg(num_slices=n_slices, p=p, mu=mu, sigma=sigma)
 
-    def _compute_loss(
-        self,
-        z1: torch.Tensor,
-        z2: torch.Tensor,
-        inv_weight: float,
-        rdmreg_weight: float,
-    ):
-        """Compute the weighted invariance and RDMReg loss.
+    def forward(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tensor]:
+        """Run the shared LpJEPA forward function.
 
-        :param z1: First view's rectified projections [B, P].
-        :param z2: Second view's rectified projections [B, P], with rows
-            corresponding to the same images as z1.
-        :param inv_weight: Weight of the invariance MSE term.
-        :param rdmreg_weight: Weight of the distribution-matching term.
-        :return: Tuple of (total_loss, inv_loss, rdmreg_loss), with unweighted
-            invariance and RDMReg components.
+        Args:
+            batch: Two-view training batch or evaluation batch, following
+                :func:`stable_pretraining.forward.lpjepa`.
+            stage: Logging prefix, such as ``"fit"`` or ``"validate"``.
+
+        Returns:
+            Dictionary of encoder features, rectified projections, optional
+            labels, and training losses from the shared forward function.
         """
-        inv_loss = F.mse_loss(z1, z2)
-        rdmreg_loss = self.rdmreg(z1, z2)
-        return (
-            inv_weight * inv_loss + rdmreg_weight * rdmreg_loss,
-            inv_loss,
-            rdmreg_loss,
-        )
-
-    def forward(
-        self,
-        view1: torch.Tensor,
-        view2: Optional[torch.Tensor] = None,
-    ) -> LpJEPAOutput:
-        """Compute the two-view training loss or single-view encoder features.
-
-        :param view1: First augmented view in training, or the image batch
-            in evaluation, with shape [B, C, H, W].
-        :param view2: Second augmented view of the same images, in the same
-            batch order. Required in training and ignored in evaluation.
-        :return: LpJEPAOutput with losses and concatenated encoder features
-            [2B, D] in training. In evaluation, features have shape [B, D]
-            and all loss components are zero.
-        """
-        if self.training:
-            assert view2 is not None, "view2 must be provided in training mode"
-
-            h1 = self.encoder(view1)
-            h2 = self.encoder(view2)
-            z1 = F.relu(self.projector(h1))
-            z2 = F.relu(self.projector(h2))
-            loss, inv_loss, rdmreg_loss = self._compute_loss(
-                z1, z2, self.inv_weight, self.rdmreg_weight
-            )
-            return LpJEPAOutput(
-                loss=loss,
-                embedding=torch.cat([h1, h2], dim=0),
-                inv_loss=inv_loss,
-                rdmreg_loss=rdmreg_loss,
-            )
-        else:
-            embedding = self.encoder(view1)
-            zero = embedding.new_zeros(())
-            return LpJEPAOutput(
-                loss=zero,
-                embedding=embedding,
-                inv_loss=zero,
-                rdmreg_loss=zero,
-            )
+        return lpjepa_forward(self, batch, stage)
